@@ -1,4 +1,7 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Body
+from fastapi.middleware.cors import CORSMiddleware
+from dateutil import parser as date_parser  # pip install python-dateutil (already done earlier)
+
 from sqlalchemy.orm import Session
 from app.routers import games
 
@@ -14,6 +17,91 @@ app = FastAPI(
     title="Steam Games API",
     version="0.1.0",
 )
+
+# CORS middleware (adjust origins as needed)
+
+# Allow frontend dev server to call the API
+
+origins = [
+    "http://localhost:5173",  # Vite default
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Helper function to sync game
+
+def sync_game_from_steam(appid: int, db: Session) -> models.Game:
+    try:
+        steam_data = fetch_steam_app_details(appid)
+    except SteamAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    if not steam_data.get("name"):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No game name returned from Steam for appid {appid}.",
+        )
+
+    genres = ", ".join(steam_data.get("genres") or [])
+    developers = ", ".join(steam_data.get("developers") or [])
+    publishers = ", ".join(steam_data.get("publishers") or [])
+    categories = ", ".join(steam_data.get("categories") or [])
+
+    release_date_str = steam_data.get("release_date")
+    release_date = None
+    if release_date_str:
+        try:
+            release_date = date_parser.parse(release_date_str).date()
+        except Exception:
+            release_date = None
+
+    game = (
+        db.query(models.Game)
+        .filter(models.Game.steam_appid == steam_data["steam_appid"])
+        .first()
+    )
+
+    if game:
+        game.name = steam_data["name"]
+        game.genre = genres
+        game.developer = developers
+        game.publisher = publishers
+        game.release_date = release_date
+        game.is_free = steam_data.get("is_free", False)
+        game.metacritic_score = steam_data.get("metacritic_score")
+        game.recommendations_count = steam_data.get("recommendations_count")
+        game.header_image = steam_data.get("header_image")
+        game.languages = steam_data.get("languages")
+        game.categories = categories
+    else:
+        game = models.Game(
+            steam_appid=steam_data["steam_appid"],
+            name=steam_data["name"],
+            genre=genres,
+            developer=developers,
+            publisher=publishers,
+            release_date=release_date,
+            is_free=steam_data.get("is_free", False),
+            metacritic_score=steam_data.get("metacritic_score"),
+            recommendations_count=steam_data.get("recommendations_count"),
+            header_image=steam_data.get("header_image"),
+            languages=steam_data.get("languages"),
+            categories=categories,
+        )
+        db.add(game)
+
+    db.commit()
+    db.refresh(game)
+    return game
+
+
+
 # Register routers
 app.include_router(games.router)
 
@@ -40,7 +128,6 @@ def read_root():
 
 # ------------ GAMES ENDPOINTS ------------
 
-#Post requests
 
 
 @app.post("/games", response_model=schemas.GameRead)
@@ -81,7 +168,7 @@ def sync_steam_game(steam_appid: int, db: Session = Depends(get_db)):
     game = sync_game_from_steam(steam_appid, db)
     return game
 
-# Get requests
+
 
 @app.get("/games", response_model=list[schemas.GameRead])
 def list_games(skip: int = 0, limit: int = 50, db: Session = Depends(get_db)):
@@ -124,52 +211,39 @@ def sample_game():
         "developer": "Valve"
     }
 
-# Helper function to sync game
 
-def sync_game_from_steam(appid: int, db: Session) -> models.Game:
+@app.post("/games/sync-steam-batch")
+def sync_steam_batch(
+    appids: list[int] = Body(..., example=[620, 570, 730]),
+    db: Session = Depends(get_db),
+):
     """
-    Fetch game info from Steam and upsert into the local database.
+    Batch-sync multiple Steam appids.
 
-    - If a game with this steam_appid exists, update its fields.
-    - Otherwise, create a new record.
+    Body: [620, 570, 730, ...]
+    Returns a list of results showing success or error per appid.
     """
-    try:
-        steam_data = fetch_steam_app_details(appid)
-    except SteamAPIError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+    results = []
+    for appid in appids:
+        try:
+            game = sync_game_from_steam(appid, db)
+            results.append({
+                "appid": appid,
+                "ok": True,
+                "id": game.id,
+                "name": game.name,
+            })
+        except HTTPException as exc:
+            results.append({
+                "appid": appid,
+                "ok": False,
+                "error": exc.detail,
+            })
+        except Exception as exc:
+            results.append({
+                "appid": appid,
+                "ok": False,
+                "error": str(exc),
+            })
+    return results
 
-    if not steam_data.get("name"):
-        raise HTTPException(
-            status_code=404,
-            detail=f"No game name returned from Steam for appid {appid}.",
-        )
-
-    # Try to find an existing game with the same steam_appid
-    game = (
-        db.query(models.Game)
-        .filter(models.Game.steam_appid == steam_data["steam_appid"])
-        .first()
-    )
-
-    # Some simple normalizations
-    genres = ", ".join(steam_data.get("genres") or [])
-    developers = ", ".join(steam_data.get("developers") or [])
-
-    if game:
-        # Update existing
-        game.name = steam_data["name"]
-        game.genre = genres
-        game.developer = developers
-    else:
-        # Create new
-        game = models.Game(
-            steam_appid=steam_data["steam_appid"],
-            name=steam_data["name"],
-            genre=genres,
-            developer=developers,
-        )
-        db.add(game)
-
-    db.commit()
-    db.refresh(game)
-    return game
